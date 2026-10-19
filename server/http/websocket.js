@@ -60,8 +60,11 @@ export function narrowDeflateOffer(header) {
  */
 export function createSessionStack(opts, { data, log, content = null, plugins = null, hosts = null }) {
   const netOptions = netOptionsFrom(opts);
+  const publicDeltas = opts.publicDeltas ?? (String(process.env.SP_PUBLIC_DELTAS || '').trim() === '1');
+  netOptions.publicDeltas = publicDeltas === true;
   const registry = new SessionRegistry({ reconnectWindowMs: netOptions.reconnectWindowMs ?? NET_DEFAULTS.reconnectWindowMs });
   const lobbyOptions = lobbyOptionsFrom(opts);
+  lobbyOptions.publicDeltas = publicDeltas === true;
   const lobby = new Lobby({ registry, log, MatchClass: opts.MatchClass, getData: () => data, seedFn: opts.seedFn, content, plugins, hosts, options: lobbyOptions });
   const network = new Network({ registry, handler: lobby, log, options: netOptions });
   return { registry, lobby, network };

@@ -174,6 +174,8 @@ import { isContentHash } from '../shared/plugins/identity.js';
 import { ruleOption } from '../shared/plugins/rules.js';
 import { msg, wireMessage } from '../shared/i18n.js';
 import { parseTestModeEnv, testModeGate, unrecognizedTestMode } from './testMode.js';
+import { PublicStream } from './publicStream.js';
+import { PUBLIC_RESYNC_UNAVAILABLE } from '../shared/publicPatch.js';
 
 /** Room code alphabet: uppercase letters without I and O (and no digits, so no 0/1). */
 export const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
@@ -289,7 +291,7 @@ export class Room {
     this.lastSummary = null;
     /**
      * Frames of the last match's end, replayed on resync to humans who have not moved on yet.
-     * @type {{ publicFrame: string | null, frames: Map<string, string>, pending: Set<string> } | null}
+     * @type {{ publicFrame?: string | null, publicFrames?: Map<string, string>, publicStream?: PublicStream, frames: Map<string, string>, pending: Set<string> } | null}
      */
     this.replay = null;
     /** @type {string[] | null} plugins of the room's set that changed on disk — the host not told yet (Lobby.pluginsChanged) */
@@ -635,6 +637,7 @@ export class Lobby {
    */
   handleMessage(session, msg, ctx = null) {
     switch (msg.t) {
+      case 'm.resync': return this.resyncPublic(session);
       case 'room.create': return this.create(session, msg);
       case 'room.join': return this.join(session, msg);
       case 'room.leave': return this.leave(session);
@@ -1374,7 +1377,8 @@ export class Lobby {
       };
     });
     // lastPublic / results: the latest m.public broadcast and the m.result frames (encoded), kept for the replay.
-    const ctx = { live: true, ended: false, disposed: false, match: null, lastPublic: null, sharedResult: null, results: new Map() };
+    const ctx = { live: true, ended: false, disposed: false, match: null, lastPublic: null, sharedResult: null, results: new Map(),
+      publicStream: this.opts.publicDeltas === true ? new PublicStream() : null };
     let seed = 0;
     try { seed = this.seedFn() >>> 0; } catch { seed = randomInt(2 ** 32); }
     const modded = room.modded;
@@ -1469,6 +1473,14 @@ export class Lobby {
 
   /** Match unicast; m.result frames are also kept for the replay. */
   matchSend(room, ctx, playerId, msg) {
+    if (ctx.publicStream && msg?.t === 'm.public') {
+      const seat = room.seatOf(playerId) || room.spectatorOf(playerId);
+      const session = this.registry.byId(playerId);
+      if (room.disposed || !seat || seat.isBot || seat.left || session?.roomCode !== room.code) return false;
+      const prepared = ctx.publicStream.prepare(msg);
+      if (!prepared) { this.log.error(`[lobby] ${room.code} unserializable unicast ${msg.t}`); return false; }
+      return ctx.publicStream.send(playerId, session.connected ? session.ws : null, prepared, true);
+    }
     if (msg && msg.t === 'm.result') {
       const data = encode(msg);
       if (data != null) ctx.results.set(playerId, data);
@@ -1478,6 +1490,16 @@ export class Lobby {
 
   /** Match broadcast; the latest m.public and a broadcast m.result are also kept for the replay. */
   matchBroadcast(room, ctx, msg) {
+    if (ctx.publicStream && msg?.t === 'm.public') {
+      const prepared = ctx.publicStream.prepare(msg);
+      if (!prepared) { this.log.error(`[lobby] ${room.code} unserializable broadcast ${msg.t}`); return; }
+      for (const seat of [...room.seats, ...room.spectators]) {
+        if (!seat || seat.isBot || seat.left) continue;
+        const session = this.registry.byId(seat.playerId);
+        if (session?.roomCode === room.code) ctx.publicStream.send(session.playerId, session.connected ? session.ws : null, prepared);
+      }
+      return;
+    }
     const data = this.broadcastRoom(room, msg);
     if (data == null) return;
     if (msg.t === 'm.public') ctx.lastPublic = data;
@@ -1491,20 +1513,23 @@ export class Lobby {
    */
   buildReplay(room, ctx) {
     const frames = new Map();
+    const publicFrames = ctx.publicStream ? new Map() : null;
     for (const s of [...room.seats, ...room.spectators]) {
       if (!s || s.isBot || s.left) continue;
       const frame = ctx.results.get(s.playerId) || ctx.sharedResult;
       if (frame) frames.set(s.playerId, frame);
+      const prepared = ctx.publicStream?.latest.get(s.playerId);
+      if (prepared) publicFrames.set(s.playerId, ctx.publicStream.full(prepared));
     }
     if (frames.size === 0) return null;
-    return { publicFrame: ctx.lastPublic, frames, pending: new Set(frames.keys()) };
+    return { ...(publicFrames ? { publicFrames, publicStream: ctx.publicStream } : { publicFrame: ctx.lastPublic }), frames, pending: new Set(frames.keys()) };
   }
 
   /** The replay frames still owed to a player (null when they moved on). @returns {string[] | null} */
   replayFor(room, playerId) {
     const r = room.replay;
     if (!r || !r.pending.has(playerId)) return null;
-    return [r.publicFrame, r.frames.get(playerId)].filter(Boolean);
+    return [r.publicFrames ? r.publicFrames.get(playerId) : r.publicFrame, r.frames.get(playerId)].filter(Boolean);
   }
 
   /** The player moved on from the result screen (acted in the room, left): stop replaying it. */
@@ -1512,6 +1537,8 @@ export class Lobby {
     const r = room.replay;
     if (!r || !r.pending.delete(playerId)) return;
     r.frames.delete(playerId);
+    r.publicFrames?.delete(playerId);
+    r.publicStream?.latest.delete(playerId);
     if (r.pending.size === 0) room.replay = null;
   }
 
@@ -1558,6 +1585,12 @@ export class Lobby {
       this.callMatch(room, room.spectatorOf(session.playerId) ? 'addSpectator' : 'onReconnect', session.playerId);
       return;
     }
+    const replay = room.replay;
+    if (replay?.publicStream && replay.pending.has(session.playerId)) {
+      replay.publicStream.resync(session.playerId, session.ws);
+      sendRaw(session.ws, replay.frames.get(session.playerId));
+      return;
+    }
     const frames = this.replayFor(room, session.playerId);
     if (frames) for (const frame of frames) sendRaw(session.ws, frame);
   }
@@ -1565,6 +1598,25 @@ export class Lobby {
   clearResync(playerId) {
     const t = this.resyncTimers.get(playerId);
     if (t) { clearTimeout(t); this.resyncTimers.delete(playerId); }
+  }
+
+  /** Public recovery is independent of match.onReconnect: no private state or combat authority changes. */
+  resyncPublic(session) {
+    if (this.opts.publicDeltas !== true) return fail(ERR.BAD_MSG, 'public deltas disabled');
+    const room = this.roomOf(session);
+    if (!room) return fail(ERR.NOT_IN_ROOM);
+    const stream = room.matchCtx?.publicStream;
+    if (stream?.latest.has(session.playerId)) {
+      stream.resync(session.playerId, session.ws);
+      return OK;
+    }
+    const replay = room.replay;
+    if (replay?.publicStream && replay.pending.has(session.playerId) && replay.publicStream.latest.has(session.playerId)) {
+      replay.publicStream.resync(session.playerId, session.ws);
+      return OK;
+    }
+    this.sendState(room, session);
+    return fail(ERR.WRONG_PHASE, PUBLIC_RESYNC_UNAVAILABLE);
   }
 
   /** Log a per-network limit refusal without letting a refusal loop flood the log. */
@@ -1713,7 +1765,11 @@ export class Lobby {
     const session = this.registry.byId(playerId);
     if (session && session.roomCode === room.code) session.roomCode = null;
     this.clearGrace(playerId);
+    const publicStream = room.matchCtx?.publicStream || room.replay?.publicStream;
     this.dropReplay(room, playerId);
+    // Only permanent departures release recovery state; disconnected current members still need it.
+    publicStream?.latest.delete(playerId);
+    if (session?.ws) publicStream?.bases.delete(session.ws);
     if (this.freeSpectatorSeat(room, playerId)) return;
     const seat = room.seatOf(playerId);
     if (!seat || seat.isBot || seat.left || room.disposed) return;

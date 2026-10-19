@@ -5,6 +5,11 @@ the **UI owner** consuming `m.public` / `m.private` / `m.result`, and anyone dri
 Normative contracts stay in DESIGN.md §6 and §8 ([design/match.md](design/match.md),
 [design/network.md](design/network.md)); this file documents the implementation and every assumption it makes.
 
+The optional protocol-2 public transport (`SP_PUBLIC_DELTAS=1`, DESIGN §8.1) runs in `server/publicStream.js`
+at the lobby's socket boundary. Match methods continue emitting canonical `m.public` objects, including hosted
+matches. `shared/publicPatch.js` reconstructs those same objects before the client's normal dispatch; private
+views, spectator visibility and the combat protocol remain the match's existing contracts. Default: protocol 1.
+
 ```
 server/match/
   Match.js         state machine, timers, round loop, co-op orchestration, views (the lobby⇄match interface is at the top)

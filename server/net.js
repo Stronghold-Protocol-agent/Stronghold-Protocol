@@ -43,7 +43,7 @@
 import { randomBytes } from 'node:crypto';
 import { isIP } from 'node:net';
 import { C2S, validateC2S } from '../shared/protocol.js';
-import { ERR, ERR_TEXT, NAME_MAX_LEN, PROTOCOL_VERSION } from '../shared/constants.js';
+import { ERR, ERR_TEXT, NAME_MAX_LEN, PROTOCOL_VERSION, PUBLIC_DELTA_PROTOCOL_VERSION } from '../shared/constants.js';
 
 /** Tunables (all overridable through the Network / SessionRegistry constructors). */
 export const NET_DEFAULTS = Object.freeze({
@@ -72,7 +72,7 @@ export const NET_DEFAULTS = Object.freeze({
  * room.setPlugins (a new visual set: every member downloads its art manifest — server/plugins/visualSet.js).
  * room.skins (docs/SKINS.md) is a small `{ [charId]: skinId }` map, sent on every edit of the appearance.
  */
-export const HEAVY_TYPES = new Set(['g.watch', 'room.loadout', 'room.ownership', 'room.diy', 'room.spectate', 'room.setPlugins', 'room.skins']);
+export const HEAVY_TYPES = new Set(['m.resync', 'g.watch', 'room.loadout', 'room.ownership', 'room.diy', 'room.spectate', 'room.setPlugins', 'room.skins']);
 
 /** Close codes (see header). */
 export const CLOSE = Object.freeze({ REPLACED: 4001, HELLO_TIMEOUT: 4002, POLICY: 1008, SHUTDOWN: 1001 });
@@ -663,8 +663,11 @@ export class Network {
   /** @param {Connection} conn @param {any} msg @param {number} now */
   onHelloMsg(conn, msg, now) {
     const rid = msg.rid;
-    if (msg.version != null && msg.version !== PROTOCOL_VERSION) {
-      this.reply(conn, errorMsg(ERR.BAD_MSG, rid, `version mismatch: server ${PROTOCOL_VERSION}`));
+    const version = this.opts.publicDeltas === true ? PUBLIC_DELTA_PROTOCOL_VERSION : PROTOCOL_VERSION;
+    const compatible = version === PROTOCOL_VERSION ? msg.version == null || msg.version === version
+      : msg.version === version || msg.versions?.includes(version);
+    if (!compatible) {
+      this.reply(conn, errorMsg(ERR.BAD_MSG, rid, `version mismatch: server ${version}`));
       return;
     }
     const name = sanitizeName(msg.name);
@@ -700,7 +703,7 @@ export class Network {
 
     let extra = null;
     try { extra = this.handler.welcomeInfo?.() ?? null; } catch (e) { this.log.error('[net] welcomeInfo crashed', e); }
-    const welcome = { ...(extra && typeof extra === 'object' ? extra : null), t: 'welcome', playerId: session.playerId, token: session.token, name: session.name, serverNow: now, version: PROTOCOL_VERSION, resumed };
+    const welcome = { ...(extra && typeof extra === 'object' ? extra : null), t: 'welcome', playerId: session.playerId, token: session.token, name: session.name, serverNow: now, version, resumed };
     if (validRid(rid)) welcome.rid = rid;
     this.reply(conn, welcome);
     try {

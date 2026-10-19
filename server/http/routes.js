@@ -17,7 +17,7 @@
 // Every response's body bytes count in the traffic counters (traffic.js meter). A route that throws is logged and
 // answers 500.
 
-import { PROTOCOL_VERSION, APP_VERSION } from '../../shared/constants.js';
+import { PROTOCOL_VERSION, PUBLIC_DELTA_PROTOCOL_VERSION, APP_VERSION } from '../../shared/constants.js';
 import { buildTag } from './buildTag.js';
 import { setSecurityHeaders, sendError, sendJson, splitUrl } from './common.js';
 import { clientAddress, isLocalIp } from '../net.js';
@@ -50,7 +50,8 @@ function contentSets(lobby) {
  */
 export function healthReport({ startedAt, network, registry, lobby, content = null, traffic, assetIndex, views, trusted }, withTraffic = false) {
   const report = {
-    ok: true, version: PROTOCOL_VERSION, app: APP_VERSION, uptimeSec: Math.round((Date.now() - startedAt) / 1000),
+    ok: true, version: network.opts?.publicDeltas === true ? PUBLIC_DELTA_PROTOCOL_VERSION : PROTOCOL_VERSION,
+    app: APP_VERSION, uptimeSec: Math.round((Date.now() - startedAt) / 1000),
     // the runtime the server is serving right now (public/js/ui/buildGuard.js): a page whose own build is
     // older than this reloads itself, so a deploy reaches clients that never reload
     build: buildTag(),

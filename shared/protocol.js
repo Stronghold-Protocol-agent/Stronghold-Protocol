@@ -494,7 +494,8 @@ const target = (v) => {
 export const C2S = {
   // session & lobby
   hello: { name: (v) => isStr(v, NAME_MAX_LEN) && v.trim().length > 0, token: (v) => v == null || isStr(v, 64), version: (v) => v == null || isInt(v, 0, 1e6),
-    noReplace: isBool, claimAt: (v) => isNum(v, 0, Number.MAX_SAFE_INTEGER), $optional: ['token', 'version', 'noReplace', 'claimAt'] },
+    versions: (v) => Array.isArray(v) && v.length > 0 && v.length <= 8 && v.every((n) => isInt(n, 1, 1e6)),
+    noReplace: isBool, claimAt: (v) => isNum(v, 0, Number.MAX_SAFE_INTEGER), $optional: ['token', 'version', 'versions', 'noReplace', 'claimAt'] },
   ping: { c: (v) => typeof v === 'number' && Number.isFinite(v) },
   // test: only the literal true (DESIGN §34.8). Omit it for a normal room — `false` is a bad field, so a
   // string cannot sneak in as "not a test". The server still refuses it unless SP_TEST_MODE is on.
@@ -548,6 +549,8 @@ export const C2S = {
   'room.consent': { cs: isContentHash, accept: isBool },
   'room.contentReady': { cs: isContentHash, ok: isBool, $optional: ['ok'] },
 
+  // Public transport recovery; never a combat reconnect or a private-state request.
+  'm.resync': {},
   // match
   'g.infoReady': { setupRevision: (v) => isInt(v, 0, 2 ** 31), $optional: ['setupRevision'] },
   'g.rerollVote': { voteId: (v) => isInt(v, 1, 2 ** 31), agree: isBool },
@@ -631,7 +634,7 @@ export const C2S = {
 export const S2C = [
   'welcome', 'ok', 'error', 'pong',
   'room.state', 'room.closed',
-  'm.public', 'm.private', 'm.field', 'm.toast', 'm.ticker', 'm.emote', 'm.result',
+  'm.public', 'm.patch', 'm.private', 'm.field', 'm.toast', 'm.ticker', 'm.emote', 'm.result',
   // m.layer { playerId, bondId, add } — own live prep layer gain; ephemeral, never replayed on resync.
   'm.layer',
   // m.unitStats { seq, round, units: [unitStatsEntry] } — the answer to g.unitStats (the requester only)

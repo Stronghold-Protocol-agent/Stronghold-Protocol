@@ -29,8 +29,9 @@
 // Shared modules are imported relatively: in the browser '../../shared/x.js' from /js/ resolves
 // to /shared/x.js (URL resolution clamps at the root); under Node it resolves to <repo>/shared.
 
-import { PROTOCOL_VERSION, ERR_TEXT } from '../../shared/constants.js';
+import { PROTOCOL_VERSION, PUBLIC_DELTA_PROTOCOL_VERSION, ERR_TEXT } from '../../shared/constants.js';
 import { validateC2S } from '../../shared/protocol.js';
+import { PublicReceiver, PUBLIC_RESYNC_UNAVAILABLE } from '../../shared/publicPatch.js';
 import { N_ } from '../../shared/i18n.js';
 
 export const REQUEST_TIMEOUT_MS = 8000;
@@ -146,6 +147,10 @@ export class Net {
     this.lastError = null;     // last NetError relevant to the connection (e.g. hello rejected)
     this.clockOffset = 0;
     this.clockSynced = false;
+    this._public = new PublicReceiver();
+    this._publicVersion = PROTOCOL_VERSION;
+    this._publicRoom = null;
+    this._publicRetry = null;
 
     this._rid = 0;
     this._pending = new Map(); // rid -> { msg, resolve, reject, timer, sent }
@@ -342,6 +347,8 @@ export class Net {
   }
 
   _teardownSocket() {
+    this._public.reset();
+    this._clearTimer('_publicRetry', 'clearTimeout');
     const ws = this.ws;
     if (ws) {
       ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
@@ -366,7 +373,8 @@ export class Net {
   _sendHello() {
     if (!this.name) return;
     const rid = this._nextRid();
-    const msg = { t: 'hello', rid, name: this.name, version: PROTOCOL_VERSION };
+    const msg = { t: 'hello', rid, name: this.name, version: PROTOCOL_VERSION,
+      versions: [PROTOCOL_VERSION, PUBLIC_DELTA_PROTOCOL_VERSION] };
     let token = null;
     try { token = this.getToken(); } catch { token = null; }
     if (typeof token === 'string' && token.length > 0 && token.length <= 64) {
@@ -538,6 +546,34 @@ export class Net {
       return;
     }
     if (!msg || typeof msg !== 'object' || Array.isArray(msg) || typeof msg.t !== 'string') return;
+    if (msg.t === 'error' && msg.rid == null && msg.code === 'WRONG_PHASE' && msg.detail === PUBLIC_RESYNC_UNAVAILABLE) {
+      this._public.reset();
+      this._clearTimer('_publicRetry', 'clearTimeout');
+      return;
+    }
+    if (msg.t === 'error' && msg.code === 'RATE' && msg.rid == null
+      && (msg.detail === 'm.resync too often' || (msg.detail == null && this._public.waiting))) {
+      if (this._public.waiting && this._publicRetry == null) this._publicRetry = this.timers.setTimeout(() => {
+        this._publicRetry = null;
+        if (this._public.waiting) this._sendRaw({ t: 'm.resync' });
+      }, 1000);
+      return;
+    }
+    if (msg.t === 'welcome') {
+      this._publicVersion = msg.version;
+      this._public.reset();
+    }
+    if (msg.t === 'room.closed' || (msg.t === 'room.state' && msg.code !== this._publicRoom)) {
+      this._public.reset();
+      this._publicRoom = msg.t === 'room.state' ? msg.code : null;
+    }
+    if (msg.t === 'm.patch' || (msg.t === 'm.public' && this._publicVersion === PUBLIC_DELTA_PROTOCOL_VERSION)) {
+      const received = this._public.receive(msg);
+      if (received.resync) this._sendRaw({ t: 'm.resync' });
+      if (!received.view) return;
+      this._clearTimer('_publicRetry', 'clearTimeout');
+      msg = received.view;
+    }
     const { t } = msg;
     const rid = msg.rid;
     const isHelloError = t === 'error' && rid != null && rid === this._helloRid;
