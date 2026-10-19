@@ -139,7 +139,8 @@ export async function startServer(opts = {}) {
   // a child process per content set; SP_MATCH_HOST=worker asks for a worker thread instead (match/host/index.js header:
   // an out-of-memory abort in a worker thread ends the whole server)
   const transport = String(process.env.SP_MATCH_HOST || '').trim().toLowerCase() === 'worker' ? 'worker' : 'process';
-  const hosts = createMatchHosts({ contents, log, options: { transport, maxWorkers: Math.max(1, policy.get().maxSets), ...(opts.matchHost || {}) } });
+  const hosts = createMatchHosts({ contents, log, simulation: opts.simulationAuthority,
+    options: { transport, maxWorkers: Math.max(1, policy.get().maxSets), ...(opts.matchHost || {}) } });
   const { registry, lobby, network } = createSessionStack(opts, { data, log, content, plugins: roomSets, hosts });
   const serveStatic = createStaticHandler({ publicDir, dataDir, sharedDir, simDir, packsDir, pluginsDir, packs, content, log, assetIndex, views, visual, contents });
   // the plugin studio (DESIGN §32.9): its page and API for this machine and the local network; it watches plugins/ only
@@ -219,7 +220,10 @@ export async function startServer(opts = {}) {
     if (closing) return closing;
     closing = (async () => {
       try { lobby.shutdown('shutdown'); } catch (e) { log.error('[shutdown] lobby', e); }
-      try { hosts.close(); } catch (e) { log.error('[shutdown] match hosts', e); }
+      try {
+        if (opts.simulationAuthority) await hosts.close();
+        else hosts.close();
+      } catch (e) { log.error('[shutdown] match hosts', e); }
       network.close();
       assetIndex?.close();
       studio?.close();

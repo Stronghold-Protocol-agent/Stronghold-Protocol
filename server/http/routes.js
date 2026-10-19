@@ -62,6 +62,7 @@ export function healthReport({ startedAt, network, registry, lobby, content = nu
     sockets: network.connectionCount, sessions: registry.size, ...lobby.stats(),
   };
   if (additional.roomProcesses) report.roomProcesses = additional.roomProcesses;
+  if (additional.simulationPermits) report.simulationPermits = additional.simulationPermits;
   if (trusted && Object.keys(trusted).length) report.plugins = trusted;
   if (withTraffic && traffic) report.traffic = traffic.snapshot();
   // content-hashed asset URLs (assetIndex.js / assetViews.js): off, building, or ready with how many files and URLs

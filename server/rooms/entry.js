@@ -5,8 +5,10 @@ import { sendSession } from '../net.js';
 import { createPeer } from './peer.js';
 import { createRoomUpdates } from './updates.js';
 import { ignoreRoomSignals } from './signals.js';
+import { createSimulationPermitClient, remoteSimulationAuthority } from './simulationClient.js';
+import { configureSimulationSlices } from '../../shared/simulationSlices.js';
 
-let srv, slot, updates, stopping = false;
+let srv, slot, updates, simulationClient, stopping = false;
 const incoming = new Map(), bySession = new Map();
 const snapshot = (session) => { const { ws: _ws, ...value } = session; return value; };
 // Group signals belong to the primary, which sends room.closed and closes sockets before stopping us.
@@ -15,6 +17,16 @@ const peer = createPeer(process, {
   async init(value) {
     slot = value.slot;
     updates = createRoomUpdates(peer);
+    const simulationAuthority = value.simulationPermits ? remoteSimulationAuthority(peer, () => { if (process.connected) process.disconnect(); }) : null;
+    if (simulationAuthority) {
+      simulationClient = createSimulationPermitClient({
+        acquire: (request) => simulationAuthority.acquire('room', process.pid, request),
+        cancel: (request) => simulationAuthority.cancel('room', request),
+        begin: (lease) => simulationAuthority.begin('room', lease),
+        release: (lease) => simulationAuthority.release('room', lease),
+      });
+      configureSimulationSlices(() => simulationClient.enter());
+    }
     const sessionHooks = {
       sessionChanged: (session, removed) => updates.session(session, removed),
       network: { async resolveHello(msg) {
@@ -26,7 +38,7 @@ const peer = createPeer(process, {
       lobby: { roomChanged: (room, removed) => updates.room(room, removed), dispatch },
     };
     srv = await startServer({ ...value.opts, port: 0, host: '127.0.0.1', roomOwnerHost: value.ownerHost,
-      roomProcs: 1, roomChild: true, quiet: true, studio: false, assetIndex: false, sessionHooks });
+      roomProcs: 1, roomChild: true, quiet: true, studio: false, assetIndex: false, sessionHooks, simulationAuthority });
     if (value.trusted) srv.lobby.trustedRuntime = { event: (event, data) => peer.notify('trustedEvent', { event, value: data }).catch(() => {}) };
     return { port: srv.port };
   },
@@ -60,7 +72,7 @@ const peer = createPeer(process, {
     }
     return rollback ? updates.snapshot() : undefined;
   },
-  async stop() { stopping = true; await srv?.close(); updates?.close(); return true; },
+  async stop() { stopping = true; await srv?.close(); simulationClient?.close(); updates?.close(); return true; },
   async publicSet({ kind, hash }) {
     if (!srv || stopping || !/^[0-9a-f]{16}$/.test(hash)) return false;
     if (kind === 'cs') return !!srv.contents.file(hash, 'index.json');
@@ -149,4 +161,4 @@ process.on('message', (msg, socket) => {
   srv.server.emit('upgrade', req, socket, Buffer.from(msg.head, 'base64'));
   socket.resume();
 });
-process.on('disconnect', async () => { stopping = true; await srv?.close(); updates?.close(); process.exit(0); });
+process.on('disconnect', async () => { stopping = true; await srv?.close(); simulationClient?.close(); updates?.close(); process.exit(0); });

@@ -7,6 +7,7 @@ import { clientAddress } from '../net.js';
 import { LOBBY_DEFAULTS } from '../lobby.js';
 import { splitUrl } from '../http/common.js';
 import { roomProcessCount } from './config.js';
+import { simulationPermitCount, createSimulationBroker } from './simulationBroker.js';
 
 export { roomProcessCount } from './config.js';
 
@@ -14,9 +15,12 @@ const ENTRY = fileURLToPath(new URL('./entry.js', import.meta.url));
 const HEALTH_MISS_LIMIT = 3;
 export async function startRoomSupervisor(opts, start) {
   const count = roomProcessCount(opts.roomProcs ?? process.env.SP_ROOM_PROCS);
+  const log = opts.log || { info() {}, warn() {}, error() {}, debug() {} };
+  const permits = simulationPermitCount(opts.simPermits ?? process.env.SP_SIM_PERMITS, (message) => log.warn(message));
+  const simulation = permits ? createSimulationBroker(permits) : null;
   // Injected constructors and functions have no meaningful cross-process representation.
   if (opts.MatchClass || opts.seedFn) throw new TypeError('room processes require serializable server options');
-  const childOptions = Object.fromEntries(Object.entries(opts).filter(([key]) => !['log', 'fetch', 'routeUpgrade', 'routeRequest', 'sessionHooks', 'healthExtra', 'roomRestart', 'roomFailure'].includes(key)));
+  const childOptions = Object.fromEntries(Object.entries(opts).filter(([key]) => !['log', 'fetch', 'routeUpgrade', 'routeRequest', 'sessionHooks', 'healthExtra', 'roomRestart', 'roomFailure', 'simulationAuthority'].includes(key)));
   const serializable = JSON.parse(JSON.stringify(childOptions, (_key, value) => {
     if (['function', 'symbol', 'bigint'].includes(typeof value)) throw new TypeError('room processes require serializable server options');
     return value;
@@ -25,8 +29,7 @@ export async function startRoomSupervisor(opts, start) {
   const ownerLookups = new Map(), connectionsByKey = new Map();
   const restart = { baseMs: 100, maxMs: 5000, stableMs: 30000, maxFailures: 6,
     healthTimeoutMs: 5000, healthIntervalMs: 1000, ...opts.roomRestart };
-  let srv, closing, stopping = false, booting = true, fatal = false, seq = 0;
-  const log = opts.log || { info() {}, warn() {}, error() {}, debug() {} };
+  let srv, closing, stopping = false, booting = true, fatal = false, seq = 0, generation = 0;
   function publicSession(session) {
     const { ws: _ws, ...value } = session;
     return value;
@@ -77,6 +80,7 @@ export async function startRoomSupervisor(opts, start) {
   }
   const prune = setInterval(() => {
     const now = Date.now();
+    simulation?.prune();
     for (const slot of slots) if (available(slot) && !slot.checking) {
       slot.checking = true;
       slot.peer.request('health', null, restart.healthTimeoutMs).then((value) => {
@@ -123,6 +127,7 @@ export async function startRoomSupervisor(opts, start) {
   function health() {
     const live = alive();
     return { ok: !fatal && live.length > 0, contentSets: new Set([...rooms.values()].map((r) => r.cs).filter(Boolean)).size,
+      ...(simulation ? { simulationPermits: simulation.stats() } : {}),
       roomProcesses: { requested: count, ready: live.length, stopping,
         slots: slots.map((s) => ({ slot: s.id, pid: s.child.pid ?? null, ready: !!available(s), draining: s.draining,
           connections: s.connections, healthMisses: s.healthMisses, restarting: !!s.restartTimer || !!s.restarting,
@@ -167,10 +172,16 @@ export async function startRoomSupervisor(opts, start) {
       env: { ...process.env, SP_ROOM_PROCS: '1' } });
     const slot = { id, child, ready: false, dead: false, draining: previous?.draining ?? false,
       connections: 0, healthMisses: 0, failures: previous?.failures ?? 0,
-      lastExit: previous?.lastExit ?? null };
+      lastExit: previous?.lastExit ?? null, generation: String(++generation) };
+    simulation?.register(slot.generation, child.pid);
     child.stderr.on('data', (data) => log.error(`[rooms:${id}] ${String(data).trim()}`));
     slots[id] = slot;
     slot.peer = createPeer(child, {
+      simAcquire(value) { return simulation?.acquire(slot.generation, value) ?? null; },
+      simCancel({ executor, request }) { simulation?.cancel(slot.generation, executor, request); },
+      simBegin({ executor, lease }) { return simulation?.begin(slot.generation, executor, lease) === true; },
+      simRelease({ executor, lease }) { simulation?.release(slot.generation, executor, lease); },
+      simExited({ executor }) { simulation?.executorExited(slot.generation, executor); },
       async hello({ token, name, noReplace, claimAt }) {
         let s = srv.registry.byToken(token), fresh = false;
         const pending = s && placements.get(s.playerId);
@@ -275,11 +286,12 @@ export async function startRoomSupervisor(opts, start) {
         if (room?.slot === id) { Object.assign(room, { running, matchKey }); starts.delete(code); }
       },
     });
-    child.once('exit', (code, signal) => { slot.lastExit = { code, signal }; markDead(slot); scheduleRespawn(slot); });
+    child.once('exit', (code, signal) => { simulation?.brokerExited(slot.generation); slot.lastExit = { code, signal }; markDead(slot); scheduleRespawn(slot); });
     child.once('error', () => { markDead(slot); child.kill('SIGKILL'); scheduleRespawn(slot); });
     child.once('disconnect', () => { if (!stopping && !slot.intentional) { markDead(slot); child.kill('SIGKILL'); } });
     try {
-      const initialized = await slot.peer.request('init', { opts: serializable, slot: id, ownerHost: srv.host, trusted: !!srv.lobby.trustedRuntime });
+      const initialized = await slot.peer.request('init', { opts: serializable, slot: id, ownerHost: srv.host,
+        trusted: !!srv.lobby.trustedRuntime, simulationPermits: !!simulation });
       if (stopping || slot.dead || slots[id] !== slot) throw new Error('room process exited during startup');
       slot.port = initialized.port;
       slot.ready = true;
@@ -398,7 +410,7 @@ export async function startRoomSupervisor(opts, start) {
     }
     const closeBase = srv.close;
     srv.roomSupervisor = {
-      rooms, slots, health,
+      rooms, slots, health, simulation,
       drain(id) { const slot = slots[id]; if (!slot?.ready) throw new Error('unknown room slot'); slot.draining = true; },
       async restart(id, { force = false } = {}) {
         if (stopping) throw new Error('room supervisor is stopping');
@@ -430,6 +442,7 @@ export async function startRoomSupervisor(opts, start) {
         for (const slot of slots) { clearTimeout(slot.restartTimer); slot.intentional = true; }
         await Promise.all(slots.map((s) => stopSlot(s)));
         await closeBase();
+        simulation?.close();
       })();
       return closing;
     };
@@ -440,6 +453,7 @@ export async function startRoomSupervisor(opts, start) {
     clearInterval(prune);
     await Promise.all(slots.map((s) => stopSlot(s, false)));
     if (srv) await srv.close();
+    simulation?.close();
     throw error;
   }
 }
